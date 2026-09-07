@@ -1,0 +1,30 @@
+{
+  "nodes": [
+    {"id": "agency:example", "type": "agency", "name": "Example Federal Agency"},
+    {"id": "program:resilience", "type": "program", "name": "Mission Resilience Program"},
+    {"id": "office:mission", "type": "program_office", "name": "Office of Mission Resilience"},
+    {"id": "office:contracts", "type": "contracting_office", "name": "Acquisition Services Division"},
+    {"id": "person:director", "type": "person", "name": "Public Official", "title": "Program Director"}
+  ],
+  "edges": [
+    {
+      "from": "office:mission",
+      "to": "program:resilience",
+      "type": "owns_program",
+      "evidence": {"source_url": "https://example.invalid/org-chart", "observed_at": "2026-09-05", "confidence": 0.95}
+    },
+    {
+      "from": "office:contracts",
+      "to": "program:resilience",
+      "type": "procures_for",
+      "evidence": {"source_url": "https://example.invalid/forecast", "observed_at": "2026-09-05", "confidence": 0.8}
+    },
+    {
+      "from": "person:director",
+      "to": "office:mission",
+      "type": "administers",
+      "evidence": {"source_url": "https://example.invalid/leadership", "observed_at": "2026-09-05", "confidence": 0.9}
+    }
+  ]
+}
+
