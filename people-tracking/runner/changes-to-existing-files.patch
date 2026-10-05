@@ -1,0 +1,677 @@
+diff --git a/.env.example b/.env.example
+index c16c588..66d881a 100644
+--- a/.env.example
++++ b/.env.example
+@@ -63,6 +63,43 @@ SAM_API_KEY_FALLBACK_2=
+ # people cap above no longer applies.
+ # SAM_PEOPLE_SYNC_API_KEY=
+ # SAM_PEOPLE_SYNC_DAILY_BUDGET=1000
++# Government people tracking ({"people_sources": {"source": ...}} schedules).
++# FPDS contracting staff: SAM Contract Awards API key (empty skips this monitor),
++# offices always read on top of tracked offices, daily call cap (no quota
++# headers come back, so the monitor counts), and the public-record lag in days.
++# SAM_CONTRACT_AWARDS_API_KEY=
++# CHROMIE_PEOPLE_FPDS_OFFICES=N00024
++# CHROMIE_PEOPLE_SAM_DAILY_CALLS=50
++# CHROMIE_PEOPLE_SAM_LAG_DAYS=90
++# Official biography pages (navy.mil flag officers, DON senior executives): pages
++# per index per run, and the pause between fetches (the hosts reset fast readers).
++# CHROMIE_PEOPLE_BIO_PAGES_PER_RUN=150
++# CHROMIE_PEOPLE_BIO_DELAY_S=2
++# Leadership sources. war.gov releases: listing pages per run. Senate nominations
++# (api.congress.gov, api.data.gov key): calls per run and first-run backfill days.
++# DVIDS stories: stories per run and first-run backfill days. Story and release
++# text the fixed forms miss goes to a linted model (OPENAI_API_KEY; unset skips
++# the model only), capped per run.
++# CHROMIE_PEOPLE_RELEASE_PAGES=3
++# DATA_GOV_API_KEY=
++# CHROMIE_PEOPLE_NOMINATION_CALLS=400
++# CHROMIE_PEOPLE_NOMINATIONS_BACKFILL_DAYS=730
++# DVIDS_API_KEY=
++# CHROMIE_PEOPLE_DVIDS_STORIES=60
++# CHROMIE_PEOPLE_DVIDS_BACKFILL_DAYS=90
++# CHROMIE_PEOPLE_EXTRACT_MODEL=
++# CHROMIE_PEOPLE_EXTRACT_MAX_CALLS=20
++# Licensed people data, monthly, for tracked people and offices only (empty keys skip
++# their vendor). Coresignal: search is free, each collect costs 10 credits, capped per
++# run. Orange Slice: one LinkedIn SQL sweep per tracked office, offices per run, and
++# how far back an alumni departure counts. A profile joins a person only when name,
++# office, dates and place (the office address from SAM notices) all agree.
++# CORESIGNAL_API_KEY=
++# CORESIGNAL_MONTHLY_COLLECTS=30
++# ORANGESLICE_API_KEY=
++# ORANGESLICE_MCP_URL=
++# ORANGESLICE_MONTHLY_OFFICES=10
++# ORANGESLICE_ALUMNI_MONTHS=36
+ # Per monitor run: title-first, then capped ncode; synopsis bounded separately.
+ # SAM_MONITOR_MAX_SEARCH_PER_RUN=12
+ # SAM_MONITOR_MAX_AGENCY_PER_RUN=6
+diff --git a/deploy/handler.py b/deploy/handler.py
+index 380c91a..187642d 100644
+--- a/deploy/handler.py
++++ b/deploy/handler.py
+@@ -17,6 +17,8 @@ Event shapes:
+     # Tenant Company Brain deterministic ledger backfill.
+   { "gov_intel": { "action": "work|sync|backfill", "max_jobs": 100, "max_pages": 20 } }
+     # Authorized licensed-intelligence feed; shadow publishing is the default.
++  { "people_sources": { "source": "fpds_staff|bio_pages|war_gov_releases|congress_nominations|dvids_leadership|moves|vendors" } }
++    # Government people monitors: positions, identities and moves from one source per run.
+   { "pursuit_authoritative_intel": { "action": "enqueue|work|refresh|backfill", ... } }
+     # Contract-owned GSA OIG and GAO evidence; intake/acceptance is the only initial trigger.
+   { "gov_procurement": { "action": "stage|work|discover|match_recompetes|compile_brain", ... } }
+@@ -1010,6 +1012,13 @@ def handler(event: dict[str, Any] | None, context: Any) -> dict[str, Any]:
+             )
+             return run_gov_intel(event, soft_deadline_epoch=soft_deadline_epoch)
+ 
++        people_sources = event.get("people_sources")
++        if isinstance(people_sources, dict):
++            from orchestration.gov.people.worker import run as run_people_sources
++
++            logger.info("handler people_sources source=%s", people_sources.get("source"))
++            return run_people_sources(event, soft_deadline_epoch=soft_deadline_epoch)
++
+         company_brain = event.get("company_brain")
+         if isinstance(company_brain, dict):
+             from orchestration.gov.company_brain import run_company_brain
+diff --git a/deploy/template.yaml b/deploy/template.yaml
+index e375e4d..dad723e 100644
+--- a/deploy/template.yaml
++++ b/deploy/template.yaml
+@@ -101,6 +101,47 @@ Parameters:
+     Type: String
+     Default: "1000"
+     Description: Daily request cap for the dedicated people-sync key. Ignored unless SamPeopleSyncApiKey is set; match the key's tier.
++  SamContractAwardsApiKey:
++    Type: String
++    NoEcho: true
++    Default: ""
++    Description: SAM.gov key for the Contract Awards API (FPDS contracting staff monitor). Empty skips that monitor only.
++  PeopleFpdsOffices:
++    Type: String
++    Default: "N00024"
++    Description: Comma-separated FPDS contracting office codes the staff monitor always reads, on top of offices companies track.
++  PeopleSamDailyCalls:
++    Type: String
++    Default: "50"
++    Description: Daily call cap for the Contract Awards key (SAM sends no quota headers); match the key tier.
++  PeopleBioPagesPerRun:
++    Type: String
++    Default: "150"
++    Description: Official biography pages read per index each daily run; the cursor wraps, so every bio is re-read in turn.
++  DataGovApiKey:
++    Type: String
++    NoEcho: true
++    Default: ""
++    Description: api.data.gov key for api.congress.gov (Senate nominations people monitor).
++  DvidsApiKey:
++    Type: String
++    NoEcho: true
++    Default: ""
++    Description: DVIDS public API key (command and leadership stories people monitor).
++  CoresignalApiKey:
++    Type: String
++    NoEcho: true
++    Default: ""
++    Description: Coresignal API key (monthly check of tracked people who left government).
++  OrangeSliceApiKey:
++    Type: String
++    NoEcho: true
++    Default: ""
++    Description: Orange Slice API key (monthly alumni sweep of tracked offices).
++  OrangeSliceMcpUrl:
++    Type: String
++    Default: ""
++    Description: Orange Slice MCP endpoint URL.
+   HigherGovApiKey:
+     Type: String
+     NoEcho: true
+@@ -273,6 +314,15 @@ Resources:
+           SAM_DAILY_REQUEST_BUDGET: !Ref SamDailyRequestBudget
+           SAM_PEOPLE_SYNC_API_KEY: !Ref SamPeopleSyncApiKey
+           SAM_PEOPLE_SYNC_DAILY_BUDGET: !Ref SamPeopleSyncDailyBudget
++          SAM_CONTRACT_AWARDS_API_KEY: !Ref SamContractAwardsApiKey
++          CHROMIE_PEOPLE_FPDS_OFFICES: !Ref PeopleFpdsOffices
++          CHROMIE_PEOPLE_SAM_DAILY_CALLS: !Ref PeopleSamDailyCalls
++          CHROMIE_PEOPLE_BIO_PAGES_PER_RUN: !Ref PeopleBioPagesPerRun
++          DATA_GOV_API_KEY: !Ref DataGovApiKey
++          DVIDS_API_KEY: !Ref DvidsApiKey
++          CORESIGNAL_API_KEY: !Ref CoresignalApiKey
++          ORANGESLICE_API_KEY: !Ref OrangeSliceApiKey
++          ORANGESLICE_MCP_URL: !Ref OrangeSliceMcpUrl
+           CHROMIE_GOV_DISCOVERY_PROCESSED_MEMORY_DAYS: !Ref GovDiscoveryProcessedMemoryDays
+           HIGHERGOV_API_KEY: !Ref HigherGovApiKey
+           BLS_API_KEY: !Ref BlsApiKey
+@@ -409,6 +459,111 @@ Resources:
+         RoleArn: !GetAtt WorkflowSchedulerInvokeRole.Arn
+         Input: '{"scenario_id":"gov_people_sam_sync","params":{"id":"gov_people_sam_sync","backfill_years":10,"page_size":1000,"max_pages_per_run":100,"request_delay_s":6.1,"active_only":true}}'
+ 
++  # Contracting staff from newly public FPDS days; the cursor and call cap make reruns cheap.
++  PeopleFpdsStaffSchedule:
++    Type: AWS::Scheduler::Schedule
++    Properties:
++      Name: chromie-people-fpds-staff
++      GroupName: !Ref WorkflowScheduleGroup
++      ScheduleExpression: cron(15 6 * * ? *)
++      FlexibleTimeWindow:
++        Mode: "OFF"
++      State: ENABLED
++      Target:
++        Arn: !GetAtt WorkflowRunnerFunction.Arn
++        RoleArn: !GetAtt WorkflowSchedulerInvokeRole.Arn
++        Input: '{"people_sources":{"source":"fpds_staff"}}'
++
++  # Official biography pages: current posts, and start dates where the bio states them.
++  PeopleBioPagesSchedule:
++    Type: AWS::Scheduler::Schedule
++    Properties:
++      Name: chromie-people-bio-pages
++      GroupName: !Ref WorkflowScheduleGroup
++      ScheduleExpression: cron(45 6 * * ? *)
++      FlexibleTimeWindow:
++        Mode: "OFF"
++      State: ENABLED
++      Target:
++        Arn: !GetAtt WorkflowRunnerFunction.Arn
++        RoleArn: !GetAtt WorkflowSchedulerInvokeRole.Arn
++        Input: '{"people_sources":{"source":"bio_pages"}}'
++
++  # war.gov general/flag officer and senior executive announcements: stated upcoming moves.
++  PeopleWarGovReleasesSchedule:
++    Type: AWS::Scheduler::Schedule
++    Properties:
++      Name: chromie-people-war-gov-releases
++      GroupName: !Ref WorkflowScheduleGroup
++      ScheduleExpression: cron(5 7 * * ? *)
++      FlexibleTimeWindow:
++        Mode: "OFF"
++      State: ENABLED
++      Target:
++        Arn: !GetAtt WorkflowRunnerFunction.Arn
++        RoleArn: !GetAtt WorkflowSchedulerInvokeRole.Arn
++        Input: '{"people_sources":{"source":"war_gov_releases"}}'
++
++  # Senate nominations and confirmations for defense and homeland posts.
++  PeopleCongressNominationsSchedule:
++    Type: AWS::Scheduler::Schedule
++    Properties:
++      Name: chromie-people-congress-nominations
++      GroupName: !Ref WorkflowScheduleGroup
++      ScheduleExpression: cron(20 7 * * ? *)
++      FlexibleTimeWindow:
++        Mode: "OFF"
++      State: ENABLED
++      Target:
++        Arn: !GetAtt WorkflowRunnerFunction.Arn
++        RoleArn: !GetAtt WorkflowSchedulerInvokeRole.Arn
++        Input: '{"people_sources":{"source":"congress_nominations"}}'
++
++  # DVIDS change-of-command and leadership stories.
++  PeopleDvidsLeadershipSchedule:
++    Type: AWS::Scheduler::Schedule
++    Properties:
++      Name: chromie-people-dvids-leadership
++      GroupName: !Ref WorkflowScheduleGroup
++      ScheduleExpression: cron(35 7 * * ? *)
++      FlexibleTimeWindow:
++        Mode: "OFF"
++      State: ENABLED
++      Target:
++        Arn: !GetAtt WorkflowRunnerFunction.Arn
++        RoleArn: !GetAtt WorkflowSchedulerInvokeRole.Arn
++        Input: '{"people_sources":{"source":"dvids_leadership"}}'
++
++  # After the people sources: FPDS staff moves, then alerts for every move recorded since.
++  PeopleMovesSchedule:
++    Type: AWS::Scheduler::Schedule
++    Properties:
++      Name: chromie-people-moves
++      GroupName: !Ref WorkflowScheduleGroup
++      ScheduleExpression: cron(55 7 * * ? *)
++      FlexibleTimeWindow:
++        Mode: "OFF"
++      State: ENABLED
++      Target:
++        Arn: !GetAtt WorkflowRunnerFunction.Arn
++        RoleArn: !GetAtt WorkflowSchedulerInvokeRole.Arn
++        Input: '{"people_sources":{"source":"moves"}}'
++
++  # Licensed people data for tracked people and offices; collects are capped by CORESIGNAL_MONTHLY_COLLECTS.
++  PeopleVendorsSchedule:
++    Type: AWS::Scheduler::Schedule
++    Properties:
++      Name: chromie-people-vendors
++      GroupName: !Ref WorkflowScheduleGroup
++      ScheduleExpression: cron(15 7 2 * ? *)
++      FlexibleTimeWindow:
++        Mode: "OFF"
++      State: ENABLED
++      Target:
++        Arn: !GetAtt WorkflowRunnerFunction.Arn
++        RoleArn: !GetAtt WorkflowSchedulerInvokeRole.Arn
++        Input: '{"people_sources":{"source":"vendors"}}'
++
+   # Resume deferred ingestion within the day; daily freshness and leases avoid duplicate work.
+   GovGrantsSimplerSchedule:
+     Type: AWS::Scheduler::Schedule
+diff --git a/orchestration/gov/opportunity_notifications.py b/orchestration/gov/opportunity_notifications.py
+index a25133e..59e4905 100644
+--- a/orchestration/gov/opportunity_notifications.py
++++ b/orchestration/gov/opportunity_notifications.py
+@@ -216,12 +216,53 @@ def build_assignment_email(
+     return {"subject": subject, "html": html_body, "text": text_body}
+ 
+ 
++def build_person_moved_email(
++    notification: dict[str, Any],
++    *,
++    app_url: str | None = None,
++) -> dict[str, str]:
++    """A tracked person changed post: the move, how sure it is, its date and basis, and a link to their timeline."""
++    payload = _object(notification.get("payload"))
++    heading = {"confirmed": "Tracked person: confirmed move", "reported": "Tracked person: reported move",
++               "inferred": "Tracked person: inferred move"}.get(str(payload.get("certainty")), "Tracked person moved")
++    subject = str(notification.get("title") or "A person you track changed post")
++    body = str(notification.get("body") or "")
++    base_url = (app_url or digest_app_url()).rstrip("/")
++    # The directory names a person by "contact:<id>".
++    url = f"{base_url}/contractors/directory?person=contact%3A{payload.get('contact_id') or ''}"
++    source_url = str(payload.get("source_url") or "")
++    source_link = (
++        f'<p style="margin:10px 0 0;font-size:13px"><a href="{html.escape(source_url)}" style="color:#2563eb">Source record</a></p>'
++        if source_url.startswith(("http://", "https://"))
++        else ""
++    )
++    html_body = f"""<!DOCTYPE html>
++<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(subject)}</title></head>
++<body style="margin:0;padding:32px 16px;background:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#18181b">
++  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="max-width:560px;margin:0 auto">
++    <tr><td style="padding:0 4px 16px"><strong>chromie</strong><span style="color:#a1a1aa">.dev</span></td></tr>
++    <tr><td style="padding:28px 32px;background:#fff;border:1px solid #e4e4e7;border-radius:8px">
++      <p style="margin:0 0 8px;font-size:13px;font-weight:600;color:#2563eb">{html.escape(heading)}</p>
++      <h1 style="margin:0;font-size:19px;line-height:1.4">{html.escape(subject)}</h1>
++      <p style="margin:10px 0 0;color:#52525b;font-size:14px">{html.escape(body)}</p>
++      {source_link}
++      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:24px 0 0"><tr><td style="border-radius:6px;background:#18181b"><a href="{html.escape(url)}" style="display:inline-block;padding:10px 20px;color:#fff;text-decoration:none;font-size:14px;font-weight:600">Open timeline</a></td></tr></table>
++    </td></tr>
++  </table>
++</body></html>"""
++    text_lines = [heading, subject, "", body]
++    if source_link:
++        text_lines.append(f"Source record: {source_url}")
++    text_lines.extend(["", f"Open timeline: {url}"])
++    return {"subject": subject, "html": html_body, "text": "\n".join(text_lines)}
++
++
+ def send_pending_user_notifications(
+     sb: Any,
+     *,
+     limit: int = 20,
+ ) -> dict[str, Any]:
+-    """Retry failed assignment emails with a compare-and-set delivery claim."""
++    """Send pending move alerts and retry failed assignment emails with a compare-and-set delivery claim."""
+     result: dict[str, Any] = {
+         "sent": 0,
+         "failed": 0,
+@@ -297,7 +338,8 @@ def send_pending_user_notifications(
+             result["skipped"] += 1
+             continue
+         try:
+-            email = build_assignment_email(row)
++            builder = build_person_moved_email if row.get("event_kind") == "person_moved" else build_assignment_email
++            email = builder(row)
+             message_id = send_platform_email(
+                 to=[str(row.get("recipient_email") or "")],
+                 subject=email["subject"],
+diff --git a/orchestration/gov/people_affiliations.py b/orchestration/gov/people_affiliations.py
+index e5bcd64..b86060e 100644
+--- a/orchestration/gov/people_affiliations.py
++++ b/orchestration/gov/people_affiliations.py
+@@ -13,18 +13,22 @@ from datetime import datetime, timezone
+ from typing import Any, Iterable
+ from uuid import NAMESPACE_URL, uuid5
+ 
++from orchestration.gov.people.writer import (
++    MONITOR_SOURCES,
++    _insert_batches,
++    _paged,
++    _upsert_batches,
++    is_shared_inbox,
++    normalize_text,
++    upsert_positions,
++)
++
+ 
+-PAGE_SIZE = 1000
+ POSITION_SOURCE = "directory_affiliation"
+ ORGANIZATION_SOURCE = "canonical_agencies"
+ AWARD_CANONICAL_SOURCE = "award_directory_canonicalization"
+-_NON_AFFILIATION_SOURCES = {"sam_gov", AWARD_CANONICAL_SOURCE}
++_NON_AFFILIATION_SOURCES = {"sam_gov", AWARD_CANONICAL_SOURCE, *MONITOR_SOURCES}
+ 
+-_SHARED_INBOX_RE = re.compile(
+-    r"(?:^|[._-])(office|info|help|support|contact|admin|acquisition|contracts?|"
+-    r"procurement|smallbusiness|osdbu|inquiries|mailbox|team)(?:[._+-]|@)",
+-    re.IGNORECASE,
+-)
+ _PAREN_RE = re.compile(r"\(([^)]+)\)")
+ _GENERIC_ROLE_RE = re.compile(
+     r"^(?:contract(?:ing)? (?:officer|specialist)|program (?:manager|officer)|"
+@@ -34,14 +38,6 @@ _GENERIC_ROLE_RE = re.compile(
+ _GENERIC_NAME_RE = re.compile(r"\b(?:office|program|utilization|small business)\b", re.IGNORECASE)
+ 
+ 
+-def normalize_text(value: object) -> str:
+-    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+-
+-
+-def is_shared_inbox(email: object) -> bool:
+-    return bool(_SHARED_INBOX_RE.search(str(email or "").strip()))
+-
+-
+ def is_specific_person_name(value: object) -> bool:
+     name = str(value or "").strip()
+     words = name.split()
+@@ -78,6 +74,9 @@ def person_identity(row: dict[str, Any]) -> str:
+ 
+ def position_role(row: dict[str, Any]) -> str:
+     value = normalize_text(row.get("role") or row.get("contact_type") or row.get("title"))
++    # A program executive officer leads a portfolio of programs, not one program.
++    if "program executive" in value:
++        return "acquisition_leader"
+     if "deputy" in value and "program" in value:
+         return "deputy_program_manager"
+     if "program manager" in value or value == "program":
+@@ -287,34 +286,9 @@ def organization_rows(agencies: Iterable[dict[str, Any]]) -> list[dict[str, Any]
+     return output
+ 
+ 
+-def _paged(query_factory: Any) -> list[dict[str, Any]]:
+-    rows: list[dict[str, Any]] = []
+-    while True:
+-        query = query_factory()
+-        if hasattr(query, "range"):
+-            response = query.range(len(rows), len(rows) + PAGE_SIZE - 1).execute()
+-        else:
+-            response = query.limit(PAGE_SIZE).execute()
+-        page = [dict(row) for row in (getattr(response, "data", None) or [])]
+-        rows.extend(page)
+-        if len(page) < PAGE_SIZE or not hasattr(query, "range"):
+-            return rows
+-
+-
+-def _upsert_batches(sb: Any, table: str, rows: list[dict[str, Any]], conflict: str) -> None:
+-    for start in range(0, len(rows), 500):
+-        sb.table(table).upsert(rows[start : start + 500], on_conflict=conflict).execute()
+-
+-
+-def _insert_batches(sb: Any, table: str, rows: list[dict[str, Any]]) -> None:
+-    for start in range(0, len(rows), 500):
+-        sb.table(table).insert(rows[start : start + 500]).execute()
+-
+-
+ def reconcile_people_affiliations(sb: Any, *, now: datetime | None = None) -> dict[str, Any]:
+     clock = now or datetime.now(timezone.utc)
+     timestamp = clock.isoformat()
+-    today = clock.date().isoformat()
+     agencies = _paged(lambda: sb.table("agencies").select("*").order("id"))
+     contacts = _paged(lambda: sb.table("gov_contacts").select("*").order("id"))
+     award_pocs = _paged(
+@@ -421,56 +395,16 @@ def reconcile_people_affiliations(sb: Any, *, now: datetime | None = None) -> di
+             "organization_id": org["id"],
+             "role_type": role,
+             "raw_title": str(contact.get("title") or "").strip() or None,
+-            "valid_from": today,
+-            "valid_to": None,
+-            "observed_at": str(contact.get("last_seen") or timestamp),
++            "first_observed_at": str(contact.get("last_seen") or timestamp),
++            "last_observed_at": str(contact.get("last_seen") or timestamp),
+             "confidence": resolution["confidence"],
+-            "source": POSITION_SOURCE,
+             "source_ref": source_ref,
+             "source_url": str(contact.get("source_url") or "").strip() or None,
+-            "updated_at": timestamp,
+         }
+         resolved_people.add(contact_id)
+ 
+-    managed_positions = _paged(
+-        lambda: sb.table("gov_contact_positions").select("*").eq("source", POSITION_SOURCE).order("id")
+-    )
+-    active = [row for row in managed_positions if row.get("valid_to") is None]
+-    active_by_key = {
+-        (str(row["contact_id"]), str(row["organization_id"]), str(row["role_type"]), str(row.get("source_ref") or "")): row
+-        for row in active
+-    }
+-    historical_keys = {
+-        (str(row["contact_id"]), str(row["organization_id"]), str(row["role_type"]), str(row.get("source_ref") or ""))
+-        for row in managed_positions
+-        if row.get("valid_to") is not None
+-    }
+-    inserted = updated = reactivated = 0
+-    inserts: list[dict[str, Any]] = []
+-    for key, row in desired.items():
+-        current = active_by_key.get(key)
+-        if current:
+-            changed = any(
+-                current.get(field) != row.get(field)
+-                for field in ("raw_title", "confidence", "source_url")
+-            )
+-            if changed:
+-                sb.table("gov_contact_positions").update(row).eq("id", current["id"]).execute()
+-                updated += 1
+-            continue
+-        inserts.append(row)
+-        if key in historical_keys:
+-            reactivated += 1
+-        else:
+-            inserted += 1
+-    _insert_batches(sb, "gov_contact_positions", inserts)
+-
+-    obsolete = [row for key, row in active_by_key.items() if key not in desired]
+-    for start in range(0, len(obsolete), 500):
+-        ids = [row["id"] for row in obsolete[start : start + 500]]
+-        sb.table("gov_contact_positions").update(
+-            {"valid_to": today, "updated_at": timestamp}
+-        ).in_("id", ids).execute()
++    # A directory lists who holds a post today, so its dates are observed and absence closes the post.
++    positions = upsert_positions(sb, list(desired.values()), source=POSITION_SOURCE, now=clock, close_missing=True)
+ 
+     result = {
+         "status": "complete",
+@@ -481,10 +415,7 @@ def reconcile_people_affiliations(sb: Any, *, now: datetime | None = None) -> di
+         "resolved_people": len(resolved_people),
+         "unresolved_people": len(unresolved),
+         "unresolved": unresolved,
+-        "positions_inserted": inserted,
+-        "positions_updated": updated,
+-        "positions_reactivated": reactivated,
+-        "positions_closed": len(obsolete),
++        **positions,
+     }
+     sb.table("gov_api_cache").upsert(
+         {
+diff --git a/orchestration/gov/people_sam_sync.py b/orchestration/gov/people_sam_sync.py
+index d5e2fdd..0cf95e9 100644
+--- a/orchestration/gov/people_sam_sync.py
++++ b/orchestration/gov/people_sam_sync.py
+@@ -17,6 +17,8 @@ from orchestration.gov.competitive.sam_budget import (
+     try_consume_people_sync,
+ )
+ from orchestration.gov.discovery.scan_queue import soft_deadline_seconds_left
++from orchestration.gov.people.notice_contacts import write_notice_positions
++from orchestration.gov.people.writer import link_identities
+ from orchestration.supabase_client import get_supabase_client
+ from tools.schemas.models import SamGovOpportunity
+ from tools.schemas.scenario import GovPeopleSamSyncScenarioConfig
+@@ -36,6 +38,7 @@ _TOTAL_KEYS = (
+     "opportunities",
+     "contacts",
+     "affiliations",
++    "positions",
+     "marked_inactive",
+ )
+ 
+@@ -152,6 +155,7 @@ def _skipped_result(status: str, reason: str) -> dict[str, Any]:
+         "opportunities": 0,
+         "contacts": 0,
+         "affiliations": 0,
++        "positions": 0,
+         "marked_inactive": 0,
+     }
+ 
+@@ -234,6 +238,8 @@ def _run_phase(
+         # mutable `main` ref uses the newly advertised commit.
+         people_index = import_module("tools.gov_people_index")
+         persisted = people_index.persist_sam_people_index(client, opportunities)
++        notice_positions = write_notice_positions(client, items, now=current)
++        totals["positions"] += notice_positions["positions_inserted"] + notice_positions["positions_updated"]
+         totals["pages"] += 1
+         totals["records"] += len(items)
+         for key in ("opportunities", "contacts", "affiliations"):
+@@ -307,6 +313,13 @@ def _run_phase(
+     }
+ 
+ 
++def _link_contacts(sb: Any, result: dict[str, Any], now: datetime) -> dict[str, Any]:
++    # New notice e-mails can belong to people the contract-staff monitor already tracks.
++    if result.get("contacts"):
++        result["identity_links"] = link_identities(sb, now=now)
++    return result
++
++
+ def run_people_sam_sync(
+     scenario: GovPeopleSamSyncScenarioConfig,
+     *,
+@@ -372,7 +385,7 @@ def run_people_sam_sync(
+             max_pages=scenario.max_pages_per_run,
+             **phase_kwargs,
+         )
+-        return {**archive, "phase": "archive"}
++        return _link_contacts(client, {**archive, "phase": "archive"}, current)
+ 
+     active = _run_phase(
+         client,
+@@ -407,4 +420,4 @@ def run_people_sam_sync(
+             if archive["status"] == "paused":
+                 result["status"] = "paused"
+                 result["reason"] = archive["reason"]
+-    return result
++    return _link_contacts(client, result, current)
+diff --git a/tests/test_gov_people_sam_sync.py b/tests/test_gov_people_sam_sync.py
+index ab9d0d2..abcc034 100644
+--- a/tests/test_gov_people_sam_sync.py
++++ b/tests/test_gov_people_sam_sync.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import os
++import re
+ import unittest
+ from dataclasses import dataclass
+ from datetime import date, datetime, timedelta, timezone
+@@ -27,6 +28,7 @@ class _Query:
+         self.upsert_rows: list[dict[str, Any]] | None = None
+         self.update_values: dict[str, Any] | None = None
+         self.conflict = ""
++        self.ignore = False
+         self.single = False
+ 
+     def select(self, columns: str):
+@@ -45,14 +47,33 @@ class _Query:
+         self.filters.append(("lt", field, value))
+         return self
+ 
++    def like(self, field: str, value: str):
++        self.filters.append(("like", field, value))
++        return self
++
++    def ilike(self, field: str, value: str):
++        self.filters.append(("ilike", field, value))
++        return self
++
++    def order(self, *_args: Any):
++        return self
++
++    def limit(self, *_args: Any):
++        return self
++
+     def maybe_single(self):
+         self.single = True
+         return self
+ 
+-    def upsert(self, rows: dict[str, Any] | list[dict[str, Any]], on_conflict: str):
++    def upsert(self, rows: dict[str, Any] | list[dict[str, Any]], on_conflict: str, ignore_duplicates: bool = False):
+         source = [rows] if isinstance(rows, dict) else rows
+         self.upsert_rows = [dict(row) for row in source]
+         self.conflict = on_conflict
++        self.ignore = ignore_duplicates
++        return self
++
++    def insert(self, rows: list[dict[str, Any]]):
++        self.upsert_rows = [dict(row) for row in rows]
+         return self
+ 
+     def update(self, values: dict[str, Any], **kwargs: Any):
+@@ -63,13 +84,13 @@ class _Query:
+     def execute(self) -> _Response:
+         table = self.database.tables.setdefault(self.name, [])
+         if self.upsert_rows is not None:
+-            keys = self.conflict.split(",")
++            keys = self.conflict.split(",") if self.conflict else []
+             for incoming in self.upsert_rows:
+                 existing = next(
+                     (
+                         row
+                         for row in table
+-                        if all(row.get(key) == incoming.get(key) for key in keys)
++                        if keys and all(row.get(key) == incoming.get(key) for key in keys)
+                     ),
+                     None,
+                 )
+@@ -77,7 +98,7 @@ class _Query:
+                     incoming.setdefault("id", f"{self.name}-{self.database.next_id}")
+                     self.database.next_id += 1
+                     table.append(incoming)
+-                else:
++                elif not self.ignore:
+                     existing.update(incoming)
+             return _Response([])
+ 
+@@ -87,6 +108,10 @@ class _Query:
+                 rows = [row for row in rows if row.get(field) == value]
+             elif kind == "in":
+                 rows = [row for row in rows if row.get(field) in value]
++            elif kind in {"like", "ilike"}:
++                pattern = re.escape(value).replace("%", ".*")
++                flags = re.IGNORECASE if kind == "ilike" else 0
++                rows = [row for row in rows if re.fullmatch(pattern, str(row.get(field) or ""), flags)]
+             else:
+                 rows = [row for row in rows if row.get(field) < value]
+         if self.update_values is not None:
+@@ -96,7 +121,7 @@ class _Query:
+                 return _Response(None, count=len(rows))
+             return _Response(rows)
+         fields = [field.strip() for field in self.columns.split(",")]
+-        selected = [{field: row.get(field) for field in fields} for row in rows]
++        selected = [dict(row) if fields == ["*"] else {field: row.get(field) for field in fields} for row in rows]
+         return _Response(selected[0] if self.single and selected else (None if self.single else selected))
+ 
+ 
+@@ -117,6 +142,7 @@ def _sam_item(notice_id: str) -> dict[str, Any]:
+         "type": "Solicitation",
+         "uiLink": f"https://sam.gov/opp/{notice_id}/view",
+         "fullParentPathName": "HEALTH AND HUMAN SERVICES",
++        "fullParentPathCode": "075.7524.75F401",
+         "postedDate": "2026-07-01",
+         "modifiedDate": "2026-07-02",
+         "responseDeadLine": "2026-08-01T17:00:00-04:00",
+@@ -205,6 +231,10 @@ class PeopleSamSyncTests(unittest.TestCase):
+         self.assertFalse(sb.tables["sam_opportunities"][0]["active"])
+         self.assertEqual(len(sb.tables["gov_contacts"]), 1)
+         self.assertEqual(len(sb.tables["gov_contact_opportunities"]), 2)
++        # The notice contact is observed at the office that posted the notice.
++        [position] = sb.tables["gov_contact_positions"]
++        self.assertEqual((position["role_type"], position["source_ref"]), ("contract_specialist", "75F401"))
++        self.assertEqual(position["contact_id"], sb.tables["gov_contacts"][0]["id"])
+         self.assertEqual(_cursor_row(sb, "active_cursor")["payload"]["status"], "complete")
+         self.assertEqual(_cursor_row(sb, "archive_cursor")["payload"]["status"], "complete")
+ 

@@ -6,3 +6,16 @@ build/
 data/raw/
 *.pyc
 
+._*
+research/**/*.json
+research/**/*.jsonl
+datapack/
+research/results/outreach/
+
+# the report layer's specs are code; its run folders and the brief workflow's run folders are regenerable
+!research/report_specs/*.json
+research/results/briefs/
+research/**/results/reports/
+# FY2026 tables are rebuilt by research/fy2026/*.py
+research/fy2026/*.csv
+research/fy2026/collect/

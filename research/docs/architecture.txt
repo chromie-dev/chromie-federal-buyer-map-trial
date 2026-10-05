@@ -1,0 +1,494 @@
+AGENCY INTELLIGENCE, NAVY TRIAL: ARCHITECTURE
+==============================================
+
+One sentence: public documents about a buyer are saved with their provenance, read into dated
+events under the office they name, loaded into the production schema, and read back as a score,
+a weekly diff and a short list of actions, each of which points at the documents behind it.
+
+Every box below is one tool in research/tools/ and one stage of pipeline.py, so the diagram is
+also the run order.  The rules and the schema do not know the Navy; the agency sits in the organization
+seed, the registry, the saved documents and a few named constants at the top of the tools (the department
+id, the pilot offices, the feeds), so the same chain runs for another agency once those exist (document 14).
+
+
+0. LEGEND
+---------
+
+  [C]  connector      a known URL read on a schedule; no judgment; a document is saved with its
+                      url, sha256, retrieved_at and path in documents_manifest.jsonl
+  [A]  agent + lints  an LLM call with a JSON schema, answered once and kept as a cassette under
+                      the hash of (prompt, text, schema); deterministic lints drop or repair what
+                      the model returns; a rebuild replays cassettes and never pays twice
+  [R]  rules          plain code with a self-check; exact decimals where a number is shown
+  [S]  store          a file under research/ or a table in the database
+  ---  file boundary  every stage writes a file the next one reads, so any stage runs alone
+
+
+1. THE WHOLE CHAIN
+------------------
+
+   A. PUBLIC WEB: WHAT IS READ                          every row is in section 2; * = registered,
+   ================================                     saved, outside the family count
+   +---------------------------------------------------------------------------------------------+
+   | the buyer's record    NAVWAR, NAVSEA and ONR forecast spreadsheets (LRAE)                   |
+   |                       SAM.gov notices by contracting office (site JSON endpoints)           |
+   |                       FPDS ATOM feed: every base award a contracting office signed          |
+   |                       SAM public and archived extracts*  SAM opportunities API*             |
+   |                       PIEE solicitation module*  SeaPort-NxG*  DoN OSBP forecast index*     |
+   | the money             Department of the Navy justification books (P-40 exhibits, PDF)       |
+   |                       DoD Comptroller tables*  IT Dashboard*  GovInfo*  congress.gov*       |
+   | the technology ask    DoD SBIR/STTR portal (DSIP topics API)                                |
+   |                       NAVWAR commercial solutions openings*  PEO C4I industry day pages*    |
+   | the auditors          GAO reports feed   oversight.gov (inspectors general)                 |
+   |                       GAO bid protests*                                                     |
+   | leaders and Congress  navy.mil speech archive   House committee repository (docs.house)     |
+   |                       posture testimony via congress.gov*                                   |
+   | the podium            conference and event pages, found by Exa, read from the organizer     |
+   | the organization      PEO C4I, NAVWAR, PEO Digital, PAE Maritime, DoN CIO, DVIDS            |
+   |                       PAE Mission Systems*  PEO MLB*  NAVSEA small business documents*      |
+   |                       Federal Register*                                                     |
+   | the press             outlet articles found by Exa (USNI News, Breaking Defense, local,     |
+   |                       vendor releases), kept as the outlet's dated claim                    |
+   | awards and vendors    USAspending API*   DoD contract announcements feed*                   |
+   | dated copies          Wayback Machine, for what an official page said on a given day        |
+   +---------------------------------------------------------------------------------------------+
+        |
+        |  routes: direct where the host allows it; the hosted browser where the host refuses
+        |  a non-US address (Akamai 403, firewall stubs); a fetch from inside the loaded page
+        |  where even the browser's request context is refused (the SBIR portal)
+        v
+   +---------------------------------------------------------------------------------------------+
+   | 1  COLLECT   [C]  watch  sweep  audits  podium  contracts  solicitations  topics          |  network
+   |                   saves bytes and one manifest line (url, sha256, retrieved_at, path);      |
+   |                   an unchanged page is a known hash and is not read again                   |
+   +---------------------------------------------------------------------------------------------+
+        |
+        |  new or changed documents only
+        v
+   B. THE EXISTING DATABASE: WHAT IS ALREADY HELD AND REUSED
+   =========================================================
+   +---------------------------------------------------------------------------------------------+
+   | agencies, gov_organizations       the department, commands, PEOs, program offices and       |
+   |                                   contracting offices with their codes, aliases and hosts   |
+   |                                   (organization_seed.json); every event resolves to one     |
+   | gov_procurement_sources           the source registry: the 41 rows above                    |
+   | gov_needs, gov_requirement_revisions                                                        |
+   |                                   forecast rows already loaded and what changed between     |
+   |                                   releases; a cell is one of these under one office         |
+   | agency_brain_items                every dated event from earlier runs: the corpus the       |
+   |                                   back-test freezes and the pulse scores                    |
+   | gov_intelligence_evidence         every document already cited, by url and hash             |
+   | gov_contacts, gov_contact_positions                                                         |
+   |                                   people already tied to an office, with dated positions    |
+   | gov_organization_relationships    parent and program-office edges with their source         |
+   | documents_manifest + data/raw     every byte fetched before, by hash                        |
+   | research/cassettes                every agent answer already paid for; a rebuild replays    |
+   +---------------------------------------------------------------------------------------------+
+        |
+        v
+   +---------------------------------------------------------------------------------------------+
+   | 2  MODEL     [R]  memory  datapack  budget  people  programs                              |  offline
+   |              [A]  news  oversight  remarks     (cassettes replay)                           |
+   |                   reads A's new documents against B's organizations, needs and people:      |
+   |                   which office, which requirement, which person, which date                 |
+   +---------------------------------------------------------------------------------------------+
+        | dated events: (date, family, organization, text, source, evidence)
+        v
+   +---------------------------------------------------------------------------------------------+
+   | 3  LOAD      [R]  schema  layers  database  graph                                         |  postgres
+   |                   drop, create, schema.sql, layers.sql, ON_ERROR_STOP                       |
+   +---------------------------------------------------------------------------------------------+
+        | rows in the production tables; a constraint that fails stops the load
+        v
+   +---------------------------------------------------------------------------------------------+
+   | 4  READ BACK [R]  backtest (freeze, label [A], run)   pulse (score, diff, actions)          |
+   |                   coverage (grid, status)                                                   |
+   +---------------------------------------------------------------------------------------------+
+        |
+        v
+   WHAT THE CUSTOMER SEES
+   ======================
+   score per cell  .  families  .  novelty  .  momentum  .  vendors  .  contacts
+   actions from a closed list, each with the evidence rows it stands on
+   coverage grid with a reason for every empty cell
+
+   +---------------------------------------------------------------------------------------------+
+   | 5  CHECKS    every tool's --selfcheck  .  backtest check  .  pulse check                    |
+   |              coverage check  .  tests/ (pytest)  .  registry tests                          |
+   +---------------------------------------------------------------------------------------------+
+
+
+2. DATA SOURCES: EVERY REGISTERED ROW
+-------------------------------------
+
+Every source is one row in source_registry.json: publisher, official url, access mode, cadence,
+what it can answer, what it cannot, the restriction met, and the date it was verified.  The
+registry loads as gov_procurement_sources, so a row in the database can always be traced to a
+registered source.  Status is from source_status.json (events in the corpus,
+documents in the manifest).  A family is one kind of statement; the bar a cell must reach is
+THREE INDEPENDENT FAMILIES.
+
+   how read      api = documented or public JSON endpoint; webpage = HTML saved as fetched, read
+                 as its Markdown rendering (markdown.py); pdf, spreadsheet, export = files;
+                 manual = login or vendor account needed
+   route         direct from this network, or through the hosted browser where the host
+                 refuses automation from a non-US address (Akamai 403, firewall stubs)
+
+
+2a. THE BUYER'S OWN RECORD                                  families: forecast, notice, incumbent
+
+   navwar_lrae_annex25      NAVWAR HQ Contracts; www.navwar.navy.mil; spreadsheet; roughly annual
+      forecast              answers: what each requirement office plans to buy, when, how, at what
+                            value range; which contract and incumbent a follow-on replaces
+                            cannot: budget line, final solicitation number, whether it happened
+                            status: live, 429 events, 17 documents (host blocks automation; a
+                            dated archive capture is read)
+   navsea_lrae_annex25      NAVSEA HQ and field offices; www.navsea.navy.mil; spreadsheet; semiannual
+      forecast              answers: planned NAVSEA requirements by office, PEO IWS included
+                            status: live, 862 events, 24 documents (archive capture)
+   onr_lrae_annex25         Office of Naval Research / NRL; www.onr.navy.mil; spreadsheet; semiannual
+      forecast              answers: planned research procurements above $750K
+                            status: live, 68 events, 2 documents (direct download works)
+   sam_gov_site_api         GSA; sam.gov JSON endpoints behind the web application; api; real time
+      notice                answers: the requiring office named in a notice, lineage and dates
+                            back to 2014, every notice an office posted (by
+                            organization id)
+                            cannot: SeaPort-NxG task-order competitions (never posted)
+                            status: live, 310 events, 1,111 documents; keyless
+   fpds_atom_feed           GSA; www.fpds.gov; api; continuous; DoD actions publish about 90 days
+      incumbent             after signature, so an award counts as known 90 days later
+                            answers: every action by contracting office with funding office,
+                            description, IDV, solicitation and dates; the vendor
+                            cannot: requiring office unless the description names it
+                            status: live, 3,960 events, 736 documents
+
+
+2b. THE MONEY                                                                   family: budget
+
+   don_budget_justification_books
+                            Office of Budget (FMB), ASN(FM&C); www.secnav.navy.mil; pdf; annual
+      budget                answers: what the Department requested per line and how it changed;
+                            program narratives that name programs and sometimes offices
+                            cannot: which contract a line funds; enacted amounts
+                            status: live, 48 events (FY2027 OPN BA2 book), 6 documents
+   dod_comptroller_budget_materials
+                            USD (Comptroller); comptroller.defense.gov; spreadsheet; annual
+      (budget)              answers: every Navy procurement line and RDT&E program element with
+                            actual, enacted and request in one table
+                            status: 24 documents saved
+   it_dashboard_it_collect  OMB / GSA; www.itdashboard.gov; api; annual submissions
+      (budget)              answers: planned IT investment funding and contract links
+                            status: 1 document
+   govinfo_api              Government Publishing Office; api.govinfo.gov; api; daily
+      (budget)              answers: what Congress recommended, cut, added or directed by line
+                            status: 3 documents; api.data.gov key held
+   congress_gov_api         Library of Congress; api.congress.gov; api; daily
+      (budget)              answers: status and timing of authorization and appropriations bills
+                            status: 1 document; key held
+
+
+2c. THE TECHNOLOGY ASK                                                        family: programs
+
+   sbir_sttr_topics         OUSD(R&E) for DoD topics; www.dodsbirsttr.mil; api; three DoD cycles a year
+      programs              answers: Navy S&T needs by topic with the sponsoring command; the
+                            program office when the topic text names one
+                            cannot: production requirements; selections and awards; the technical
+                            point of contact
+                            status: live, 1,100 events, 1,192 documents; readable only by a
+                            fetch made from inside the loaded portal page in the hosted browser
+   navwar_cso               NAVWAR HQ Contracts; www.navwar.navy.mil; webpage; event-driven
+      (programs)            answers: capability needs opened to commercial solutions
+                            status: 17 documents; Akamai 403, archive used
+   peoc4i_industry_engagement
+                            PEO C4I via DVIDS; www.dvidshub.net; webpage; annual (February)
+      (programs)            answers: what offices told industry they need, and when
+                            status: 10 documents
+
+
+2d. THE AUDITORS                                                              family: oversight
+
+   oversight_gov_reports    CIGIE; www.oversight.gov; webpage; daily as inspectors general publish
+      oversight             answers: which audits named this department and when; what the OIG
+                            found and recommended; which command or program a finding is about
+                            cannot: whether a recommendation was closed (separate tracker)
+                            status: live, 20 events, 42 documents
+   gao_reports              GAO; www.gao.gov; webpage; several products a week
+      oversight             answers: which GAO reports named this department and when; findings
+                            and recommendations; the program or command each is about
+                            status: live, 18 events, 11 documents; the feed answers directly,
+                            product pages need the hosted browser
+   gao_bid_protests         GAO; www.gao.gov; webpage; continuous
+      (oversight)           answers: contested procurements and their solicitation numbers
+                            status: 11 documents
+
+
+2e. LEADERS, CONGRESS AND THE PODIUM                          families: leaders, congress, conference
+
+   navy_mil_speeches        CHINFO; www.navy.mil; webpage; several speeches a month
+      leaders               answers: what the CNO or SECNAV said, where and when; which
+                            capability or program a leader named as a priority
+                            cannot: remarks by systems command or PEO leaders (DVIDS and
+                            conference pages carry those)
+                            status: live, 39 events, 30 documents; hosted browser; the date
+                            read is the presented-on date, not the dateline
+   house_committee_repository
+                            Clerk of the House; docs.house.gov; webpage; as hearings are posted
+      congress              answers: which Navy leaders testified, when, before which
+                            subcommittee; what a witness statement names as priorities,
+                            programs and funding
+                            cannot: Senate hearings
+                            status: live, 89 events, 40 documents
+   navy_posture_testimony   committees; api.congress.gov; api; annual cycle
+      (congress)            answers: stated priorities and gaps by senior leaders
+                            status: 1 document
+   conference_pages_exa     the organizer of each event (Navy League, AFCEA, Potomac Officers
+                            Club, trade press); Exa is the finder only; webpage; irregular
+      conference            answers: which events a named official appears at, as the
+                            organizer states it; which capability themes an event names
+                            cannot: what was said at the event
+                            status: live, 47 events, 28 documents; some hosts refuse a plain
+                            request and come through the hosted browser
+
+
+2f. THE ORGANIZATION ITSELF                                                family: organization
+
+   navy_peoc4i_site         PEO C4I (PAE Mission Systems from 2026-05-11); www.peoc4i.navy.mil;
+      organization          webpage; irregular
+                            answers: which program offices exist, what each owns, who leads an
+                            office at a dated point
+                            status: live, 2 events, 23 documents; hosted browser
+   navy_navwar_site         NAVWAR; www.navwar.navy.mil; webpage; irregular
+      organization          answers: which office contracts for which PEO; where solicitations
+                            are published; what NAVWAR says it is made of, dated
+                            status: live, 1 event, 17 documents; hosted browser
+   dvids_navy_units         Defense Media Activity; www.dvidshub.net; webpage; event-driven
+      organization          answers: leadership changes with dates; industry engagement events;
+                            reorganization announcements
+                            status: live, 7 events, 10 documents; direct
+   navy_pae_press           ASN(RD&A) / PAE organizations; www.paemaritime.navy.mil; webpage
+      organization          answers: when portfolios were created and what moved into them
+                            status: live, 11 events, 31 documents; hosted browser
+   peo_digital_site         PEO Digital; www.peodigital.navy.mil; webpage; irregular
+      organization          answers: its own statement that it is part of PAE Mission Systems
+                            status: live, 8 events, 5 documents; hosted browser
+   don_cio_chips            DoN CIO; www.doncio.navy.mil; webpage; continuous
+      organization          answers: dated organizational changes for Navy IT acquisition
+                            status: live, 7 events, 5 documents; hosted browser
+   pae_mission_systems_site PAE Mission Systems; www.missionsystems.navy.mil; webpage; under construction
+      (organization)        answers: the new portfolio structure above the former PEOs
+                            status: 2 documents
+   peo_mlb_site             PEO MLB; www.peomlb.navy.mil; webpage; irregular
+      (organization)        answers: its own consolidation statement
+                            status: 2 documents
+   navsea_small_business_org_docs
+                            NAVSEA OSBP; www.navsea.navy.mil; pdf; roughly annual
+      (organization)        answers: NAVSEA program-office inventory and codes
+                            status: 24 documents
+   federal_register         Office of the Federal Register; www.federalregister.gov; api; daily
+      (organization)        answers: formal notices naming Navy organizations (renamings,
+                            demonstration projects, system-of-records notices)
+                            status: 1 document; no restriction
+
+
+2g. THE PRESS                                                                     family: news
+
+   news_articles_exa        the outlet that published each article (USNI News, Breaking Defense,
+      news                  local press, vendor releases); Exa is the finder only; webpage; daily
+                            answers: what an outlet reported about an office on a date, as a
+                            dated claim with the quoted span
+                            cannot: anything not quoted from an official or a document; the
+                            claim stays the outlet's
+                            status: live, 4 dated claims, 30 documents
+
+
+2h. REGISTERED, OUTSIDE THE FAMILY COUNT
+
+   notices and solicitations
+   sam_public_csv_extract   GSA; sam.gov; export; daily; every public notice with dates and
+                            POCs; 1,111 documents shared with the site api; keyless, large
+   sam_archived_yearly_extracts
+                            GSA; sam.gov; export; first-notice dates and lineage for past
+                            years (about 1.1 GB per fiscal year); verified
+   lrae_as_sam_special_notice
+                            individual contracting activities; sam.gov; forecasts posted as
+                            special notices for activities without a spreadsheet
+   sam_opportunities_api    GSA; api.sam.gov; notice text and attachments
+   piee_solicitation_module OSD DPC; piee.eb.mil; full solicitation packages behind a vendor
+                            login
+   seaport_nxg              NAVSEA / N00178; www.seaport.navy.mil; task-order competitions for
+                            support services, visible to holders only
+   don_osbp_lrae_index      DoN OSBP; www.secnav.navy.mil; the list of activities that publish
+                            forecasts
+
+   awards and vendors
+   usaspending_api          Treasury; api.usaspending.gov; api; daily; ceilings, obligations,
+                            performance periods, incumbents; 23 documents saved; no restriction
+   dod_contract_announcements
+                            DoD public affairs; www.defense.gov; api (RSS); daily; large awards
+                            the day they are made; 3 documents
+
+   dated copies
+   wayback_machine          Internet Archive; web.archive.org; api; not a government source;
+                            used only to retrieve what an official page said on a given date;
+                            23 documents
+
+
+2i. THE GRID AND THE STATUS
+
+   coverage_matrix.json     five commands (NAVSEA, NAVAIR, NAVWAR, ONR, NIWC) x twelve families
+                            (the eleven above and people); each covered cell names its source,
+                            each empty cell carries one closed reason: no_public_source,
+                            blocked, restricted, not_started.
+   source_status.json       per registry row: events, newest event, documents, last retrieval,
+                            last hash; plus hosts seen in the manifest that no row claims.
+   people                   a layer, not a family: every named person from the sources above,
+                            merged by e-mail, else by name and office, with dated positions
+
+
+3. COLLECT (network, connectors only)
+-------------------------------------
+
+   stage           tool               what it saves                     route
+   --------------  -----------------  --------------------------------  -----------------------
+   watch, sweep    news.py            articles the feeds and one query  Exa, direct
+                                      per office turn up
+   audits          oversight.py       GAO and oversight.gov reports     Exa, hosted browser
+   podium          remarks.py         speeches, House hearing pages,    hosted browser, direct,
+                                      conference pages                  Exa
+   contracts       fpds_sweep.py      every base award a contracting    FPDS ATOM, paged
+                                      office signed since FY2020
+   solicitations   sam_notices.py     every notice an office posted     SAM.gov by
+                                      since FY22                        organization id
+   topics          sbir.py sweep      every DoD SBIR/STTR topic since   a fetch made from inside
+                                      FY2020, Navy details kept         the loaded portal page in
+                                                                        the hosted browser; every
+                                                                        other route is refused
+
+   Rule: a connector never decides anything.  It saves bytes and writes one manifest line.
+   A page that changed is a new sha256; a page that did not is skipped.
+
+
+4. MODEL (offline; where judgment lives, and where it is fenced)
+----------------------------------------------------------------
+
+   [R] rules, no model                     [A] agent + lints (llm.py structured())
+   ---------------------------------       ------------------------------------------
+   memory     forecast xlsx rows into      news       one article into dated claims;
+              organization memory, needs,             lints drop undated claims and
+              revisions between releases              claims about the wrong buyer
+   datapack   release to release diff      oversight  one report into findings with the
+   budget     P-40 exhibit per P-1 line,              office and the date the auditor
+              twelve fiscal columns, event             gives; lints drop a finding with
+              dated the book month                    no quoted span
+   people     merge points of contact,     remarks    one speech, statement or page into
+              forecast POCs, speakers,                dated events; a shared reader
+              witnesses; one person per               (reader.py) applies the same rules
+              e-mail, else per name and               to every kind of page
+              office; schema role words
+   programs   one topic into one event
+              dated the pre-release day,
+              under the office the text
+              names, else the command
+                                            backtest label   one outcome into the names,
+   trace.py   office resolver: aliases and             aliases and capability terms the
+              codes in text, short aliases             requirement goes by; lints drop a
+              need a word boundary                     name that is the buyer's own or
+                                                       the paperwork's
+
+   Cassette rule: the answer to (system prompt, text, schema) is stored once under its hash in
+   research/cassettes.  A rebuild replays; only a new document is a new call.  Spend is
+   therefore proportional to new documents, never to reruns.
+
+
+5. LOAD (the production schema, nothing else)
+---------------------------------------------
+
+   schema      schema_subset.py    the loaded-table subset of the production schema
+   layers      agency_layers_sql.py emits layers.sql in dependency order:
+
+        gov_organizations ............ department, commands, PEOs, program offices, contracting
+                                       offices (ids like command:navwar, pmw:101)
+        gov_procurement_sources ...... the registry
+        gov_needs, gov_requirement_revisions
+                                     forecast rows and what changed between releases
+        gov_intelligence_evidence .... one row per saved document actually cited
+        agency_brain_items ........... every dated event: section (check constraint),
+                                       event_type, event_date, source_tier, source_provider,
+                                       primary_organization_id, source jsonb (url, sha256,
+                                       retrieved_at, path)
+        gov_contacts, gov_contact_positions
+                                     people and their dated positions (role check constraints)
+        gov_organization_relationships
+                                     edges with source, source_ref, observed_at, confidence;
+                                       an edge without them is refused
+
+   database    drop, create, schema.sql, layers.sql with ON_ERROR_STOP.  A row that breaks a
+               constraint fails the whole load, so a bad vocabulary never half-applies.
+   graph       graph_export.py writes the organization graph the program-office resolver reads.
+
+
+6. READ BACK: BACK-TEST (did the evidence come before the buyer moved)
+----------------------------------------------------------------------
+
+   backtest [R]  freeze, label [A], run, show: the families in place before each notice or award
+
+
+7. READ BACK: PULSE (what to do this week)
+------------------------------------------
+
+   cell = one requirement under one office (a forecast row or a notice with its aliases)
+
+   score = 40 * families + 20 * recency + 20 * persistence + 20 * proximity      exact decimals
+             families    distinct families seen, capped at five
+             recency     how recently the newest statement came
+             persistence how many distinct months carry a statement
+             proximity   how near the forecast's stated solicitation is, with a slip flag
+                         when a later release moved it
+
+   reports beside the score, never inside it:
+             novel_families   families first seen in the last 90 days
+             momentum         events in the last quarter against the quarter before
+             vendors          who holds the cell's contracts, by count of base awards
+             contacts         the people the record ties to the office (meet_office only)
+
+   week diff  what changed per office since the last saved pulse, in the counting register
+   actions    a closed list: meet_office, attend_event, research_program, find_partner,
+              monitor_forecast, watch_expiration, track_person; each names its evidence rows;
+              duplicates collapse by action, office and evidence
+
+
+8. THE PROVENANCE THREAD (why did the system believe X on date D)
+-----------------------------------------------------------------
+
+   document bytes under data/raw
+        |  sha256
+        v
+   manifest line: url, sha256, retrieved_at, path        (documents_manifest.jsonl)
+        |  path
+        v
+   evidence row                                          (gov_intelligence_evidence)
+        |  id
+        v
+   brain item: event_date, family, office, text, source  (agency_brain_items)
+        |
+        v
+   backtest show, pulse action: one line per family, the document and the day it became
+   available
+
+   Every number a customer sees recomputes from the rows beneath it.  There is no field that
+   was typed by hand between a document and a score.
+
+
+9. ONE REQUIREMENT THROUGH THE CHAIN
+------------------------------------
+
+   MIDS weapons data link small form factor radio, program office under NAVWAR
+
+   forecast   LRAE row names the requirement and the office ................. family 1
+   incumbent  FPDS base awards for the terminals, vendor named .............. family 2
+   notice     SAM.gov notices by the contracting office ..................... family 3  (bar)
+   budget     OPN line 2614 ATDLS, book dated April 2026 .................... family 4
+   programs   topics N241-007, N251-017, N252-D11 name the office ........... family 5
+   people     points of contact on the notices ............................. contacts on action
+   pulse      score from four parts; novelty, momentum, vendors reported; meet_office action
+              carries the contacts and the evidence rows

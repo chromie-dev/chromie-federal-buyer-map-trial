@@ -1,0 +1,356 @@
+diff --git a/src/app/api/gov-notifications/route.js b/src/app/api/gov-notifications/route.js
+index b545a6ec..0683e1eb 100644
+--- a/src/app/api/gov-notifications/route.js
++++ b/src/app/api/gov-notifications/route.js
+@@ -2,13 +2,16 @@ import { NextResponse } from "next/server"
+ import { withAuth } from "@/lib/api/with-auth"
+ import { getGovProfileById, requireGovProfileServiceClient } from "@/lib/gov/shared/gov-profiles"
+ 
++// Kinds the menu renders: task assignments and moves of people or offices the company tracks.
++const MENU_KINDS = ["task_assigned", "person_moved"]
++
+ export const GET = withAuth(async ({ supabase, user, account }) => {
+   try {
+     const govProfile = await getGovProfileById(supabase, account.gov_profile_id)
+     if (!govProfile) return NextResponse.json({ notifications: [], unread: 0 })
+     const service = requireGovProfileServiceClient()
+     const { data, error } = await service.from("gov_user_notifications").select("*")
+-      .eq("user_id", user.id).eq("gov_profile_id", govProfile.id).eq("event_kind", "task_assigned")
++      .eq("user_id", user.id).eq("gov_profile_id", govProfile.id).in("event_kind", MENU_KINDS)
+       .order("created_at", { ascending: false }).limit(30)
+     if (error) throw new Error(error.message)
+     const notifications = data || []
+@@ -32,7 +35,7 @@ export const PATCH = withAuth(async ({ request, supabase, user, account }) => {
+     let query = service.from("gov_user_notifications").update({
+       read_at: readAt,
+       updated_at: readAt,
+-    }).eq("user_id", user.id).eq("gov_profile_id", govProfile.id).eq("event_kind", "task_assigned").is("read_at", null)
++    }).eq("user_id", user.id).eq("gov_profile_id", govProfile.id).in("event_kind", MENU_KINDS).is("read_at", null)
+     if (body.all !== true) {
+       const id = String(body.id || "").trim()
+       if (!id) return NextResponse.json({ error: "Notification id is required" }, { status: 400 })
+diff --git a/src/components/pages/gov-directory-page.jsx b/src/components/pages/gov-directory-page.jsx
+index 06e4754a..9986d84d 100644
+--- a/src/components/pages/gov-directory-page.jsx
++++ b/src/components/pages/gov-directory-page.jsx
+@@ -30,6 +30,7 @@ import { GovForbiddenState } from "@/components/ui/gov/shared/gov-gate-cards"
+ import GovLoadingState from "@/components/ui/gov/shared/gov-loading-state"
+ import GovPageHeader from "@/components/ui/gov/shared/gov-page-header"
+ import GovPageShell from "@/components/ui/gov/shared/gov-page-shell"
++import PersonHistoryPanel from "@/components/ui/gov/people/person-history-panel"
+ import { useInfiniteScroll } from "@/hooks/use-infinite-scroll"
+ import { appendUniqueDirectoryRows } from "@/lib/gov/directory/pagination.mjs"
+ 
+@@ -55,6 +56,20 @@ const SELECT_CLASS = `${FILTER_CLASS} cdx-s-select cursor-pointer`
+ // Quiet lead-in above a block of facts, the Codex sidebar's section label.
+ const GROUP_LABEL = "text-[12.5px] text-cdx-ink-3"
+ 
++async function fetchLinkedPerson(personId, signal) {
++  const response = await fetch(`/api/gov-people/${encodeURIComponent(personId)}`, { signal }).catch(() => null)
++  if (!response?.ok) return null
++  const { person } = await response.json().catch(() => ({}))
++  if (!person) return null
++  return {
++    ...person,
++    role: ROLE_LABELS[person.role] ? person.role : "other",
++    sources: [person.source].filter(Boolean),
++    opportunities: [],
++    awards: [],
++  }
++}
++
+ function personSubtitle(person) {
+   return [person.title, person.agency].filter(Boolean).join(" · ")
+ }
+@@ -280,10 +295,15 @@ export default function GovDirectoryPage({
+           )
+         }
+         const nextPeople = json.people || []
+-        setPeople(nextPeople)
+-        setNextOffset(json.pagination?.next_offset ?? null)
+         const pendingPerson = pendingPersonRef.current
+         pendingPersonRef.current = null
++        // A linked person (an alert, an office page) may sit outside the loaded page; show them first.
++        if (pendingPerson?.startsWith("contact:") && !nextPeople.some((person) => person.id === pendingPerson)) {
++          const linked = await fetchLinkedPerson(pendingPerson, controller.signal)
++          if (linked) nextPeople.unshift(linked)
++        }
++        setPeople(nextPeople)
++        setNextOffset(json.pagination?.next_offset ?? null)
+         setSelectedId((current) => {
+           if (
+             pendingPerson &&
+@@ -529,6 +549,8 @@ export default function GovDirectoryPage({
+                 </ContactLink>
+               </div>
+ 
++              <PersonHistoryPanel contactId={selected.contact_id} />
++
+               <div className="mt-8">
+                 <p className={GROUP_LABEL}>Affiliated opportunities</p>
+                 <div className="mt-3 space-y-2">
+diff --git a/src/components/ui/gov/shared/gov-notification-menu.jsx b/src/components/ui/gov/shared/gov-notification-menu.jsx
+index 02d5e466..91a07ab3 100644
+--- a/src/components/ui/gov/shared/gov-notification-menu.jsx
++++ b/src/components/ui/gov/shared/gov-notification-menu.jsx
+@@ -1,7 +1,7 @@
+ "use client"
+ 
+ import { useCallback, useEffect, useState } from "react"
+-import { Bell, CheckCheck, ClipboardCheck } from "lucide-react"
++import { ArrowRightLeft, Bell, CheckCheck, ClipboardCheck } from "lucide-react"
+ import { usePathname, useRouter } from "next/navigation"
+ import { SHADOW_FLOAT } from "@/components/ui/codex-surface/surface-theme"
+ import {
+@@ -55,6 +55,11 @@ export default function GovNotificationMenu() {
+         body: JSON.stringify({ id: notification.id }),
+       }).catch(() => null)
+     }
++    if (notification.event_kind === "person_moved") {
++      const contactId = notification.payload?.contact_id
++      router.push(contactId ? `/contractors/directory?${new URLSearchParams({ person: `contact:${contactId}` })}` : "/contractors/directory")
++      return
++    }
+     const gate = notification.payload?.gate
+     const itemId = notification.payload?.item_id
+     const query = new URLSearchParams({ stage: "discover" })
+@@ -93,7 +98,9 @@ export default function GovNotificationMenu() {
+         {!notifications.length ? <p className="px-3 py-6 text-center text-[12.5px] text-cdx-ink-3">You’re all caught up.</p> : null}
+         {notifications.slice(0, 10).map((notification) => (
+           <DropdownMenuItem key={notification.id} onSelect={() => mark(notification)} className={`cursor-pointer items-start gap-2.5 rounded-[8px] px-3 py-2.5 focus:bg-cdx-hover ${notification.read_at ? "text-cdx-ink-3" : "bg-cdx-blue-bg text-cdx-ink"}`}>
+-            <ClipboardCheck className="mt-0.5 h-4 w-4 shrink-0 text-cdx-blue" />
++            {notification.event_kind === "person_moved"
++              ? <ArrowRightLeft className="mt-0.5 h-4 w-4 shrink-0 text-cdx-blue" />
++              : <ClipboardCheck className="mt-0.5 h-4 w-4 shrink-0 text-cdx-blue" />}
+             <div className="min-w-0 flex-1">
+               <p className="truncate text-[12.5px] font-medium">{notification.title}</p>
+               <p className="mt-0.5 truncate text-[11.5px] text-cdx-ink-3">{notification.body}</p>
+diff --git a/src/lib/gov/mcp/tools/people.mjs b/src/lib/gov/mcp/tools/people.mjs
+index 36fe6c45..1cdabb4d 100644
+--- a/src/lib/gov/mcp/tools/people.mjs
++++ b/src/lib/gov/mcp/tools/people.mjs
+@@ -12,6 +12,7 @@ import {
+   attachPeopleAffiliations,
+   licensedRoleFreshness,
+ } from "../../people/people-search.mjs"
++import { personTimeline } from "../../people/person-history.mjs"
+ import { filterTerm } from "../../shared/filter-term.mjs"
+ import { isMissingSchemaError } from "../../shared/missing-schema.mjs"
+ import { clipText, failed, missing, ready } from "../envelope.mjs"
+@@ -25,7 +26,10 @@ const MAX_OFFSET = 100
+ const MAX_SEARCH_SOURCE_ROWS = 2000
+ const MAX_AFFILIATIONS = 10
+ const MAX_LINK_ROWS = 50
+-const AFFILIATION_CHAR_BUDGET = 4500
++const AFFILIATION_CHAR_BUDGET = 3800
++// Dated posts and moves share one budget so a long career cannot crowd out affiliations.
++const HISTORY_CHAR_BUDGET = 1800
++const MAX_HISTORY_ROWS = 50
+ const CONTACT_ID_PATTERN =
+   /^contact:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/iu
+ 
+@@ -125,14 +129,14 @@ function projectOpportunity(opportunity) {
+   }
+ }
+ 
+-function takeWithinBudget(rows) {
++function takeWithinBudget(rows, budget = AFFILIATION_CHAR_BUDGET) {
+   const selected = []
+   // Seeded with the serialized array's own brackets; each row also pays for
+   // the comma that would separate it.
+   let size = "[]".length
+   for (const row of rows) {
+     const rowSize = JSON.stringify(row).length + ",".length
+-    if (size + rowSize > AFFILIATION_CHAR_BUDGET) break
++    if (size + rowSize > budget) break
+     selected.push(row)
+     size += rowSize
+   }
+@@ -218,6 +222,89 @@ async function loadAffiliations(ctx, person) {
+   }
+ }
+ 
++function projectPost(post) {
++  return {
++    title: clipText(post.title, 120) || null,
++    office: clipText(post.organization?.name, 120) || null,
++    // Current only while an official source recently stated it; otherwise the label says when it was last observed.
++    current: post.current,
++    standing: post.standing_label,
++    // A stated start comes from a source that says it; otherwise only the first and last sighting are known.
++    started: post.started?.date || null,
++    first_seen: post.first_seen,
++    last_seen: post.last_seen,
++    ended: post.ended?.date || null,
++    date_basis: post.started || post.ended?.basis === "stated" ? "stated" : "observed",
++    source: post.source_label,
++  }
++}
++
++function projectMove(move) {
++  return {
++    event_type: move.event_type,
++    title: clipText(move.title, 160) || null,
++    previous_title: clipText(move.previous_title, 160) || null,
++    date: move.date,
++    date_basis: move.basis,
++    // confirmed (an official source states it), reported (a licensed profile does) or inferred (two records imply it).
++    certainty: move.certainty_label,
++    status: move.status,
++    source: move.source_label,
++    source_url: clipText(move.source_url, 300) || null,
++  }
++}
++
++async function loadHistory(ctx, contactId) {
++  if (!contactId) return { history: null }
++  const [positions, moves] = await Promise.all([
++    ctx.client
++      .from("gov_contact_positions")
++      .select("id,organization_id,role_type,raw_title,valid_from,valid_to,date_basis,first_observed_at,last_observed_at,source,source_url")
++      .eq("contact_id", contactId)
++      .limit(MAX_HISTORY_ROWS),
++    ctx.client
++      .from("gov_contact_role_history")
++      .select("id,event_type,title,previous_title,effective_date,date_basis,status,source_provider,source_url,organization_id,previous_organization_id")
++      .eq("gov_contact_id", contactId)
++      .order("effective_date", { ascending: false })
++      .limit(MAX_HISTORY_ROWS),
++  ])
++  for (const result of [positions, moves]) {
++    if (result.error && !isMissingSchemaError(result.error)) {
++      return { error: failed(`Person history lookup failed: ${result.error.message}`) }
++    }
++  }
++  const organizationIds = [
++    ...new Set(
++      [...(positions.data || []), ...(moves.data || [])]
++        .flatMap((row) => [row.organization_id, row.previous_organization_id])
++        .filter(Boolean),
++    ),
++  ]
++  const organizations = organizationIds.length
++    ? await ctx.client.from("gov_organizations").select("id,name,org_type").in("id", organizationIds)
++    : { data: [], error: null }
++  if (organizations.error && !isMissingSchemaError(organizations.error)) {
++    return { error: failed(`Person history lookup failed: ${organizations.error.message}`) }
++  }
++  const timeline = personTimeline({
++    positions: positions.data || [],
++    moves: moves.data || [],
++    organizations: organizations.data || [],
++  })
++  const postRows = timeline.posts.map(projectPost)
++  const moveRows = timeline.moves.map(projectMove)
++  const selectedMoves = takeWithinBudget(moveRows, HISTORY_CHAR_BUDGET / 2)
++  const selectedPosts = takeWithinBudget(postRows, HISTORY_CHAR_BUDGET / 2)
++  return {
++    history: {
++      posts: selectedPosts,
++      moves: selectedMoves,
++      truncated: selectedPosts.length < postRows.length || selectedMoves.length < moveRows.length,
++    },
++  }
++}
++
+ const searchPeopleTool = {
+   definition: {
+     name: "search_people",
+@@ -292,7 +379,7 @@ const getPersonTool = {
+   definition: {
+     name: "get_person",
+     description:
+-      "Get bounded detail for one stored government person returned by search_people, including FPDS roles, official/source URLs, up to 10 opportunity affiliations, and up to 10 award affiliations. Accepts only search_people ids (contact:<uuid> or person:<identity_key>); performs no live enrichment.",
++      "Get bounded detail for one stored government person returned by search_people, including FPDS roles, official/source URLs, dated posts and moves (each date stated by a source or only observed), up to 10 opportunity affiliations, and up to 10 award affiliations. Accepts only search_people ids (contact:<uuid> or person:<identity_key>); performs no live enrichment.",
+     scope: "profile",
+     parameters: {
+       type: "object",
+@@ -316,8 +403,12 @@ const getPersonTool = {
+       return missing("No directory person matches this id — call search_people for a current id.")
+     }
+ 
+-    const affiliations = await loadAffiliations(ctx, found.person)
++    const [affiliations, history] = await Promise.all([
++      loadAffiliations(ctx, found.person),
++      loadHistory(ctx, found.person.contact_id),
++    ])
+     if (affiliations.error) return affiliations.error
++    if (history.error) return history.error
+     const person = affiliations.attached
+     const opportunityCandidates = person.opportunities
+       .slice(0, MAX_AFFILIATIONS)
+@@ -340,6 +431,7 @@ const getPersonTool = {
+           .map((role) => clipText(role, 80)),
+         source_urls: sourceUrls.slice(0, 12).map((url) => clipText(url, 300)),
+       },
++      history: history.history,
+       opportunities,
+       awards,
+       affiliations_truncated: {
+diff --git a/src/lib/gov/mcp/tools/people.test.mjs b/src/lib/gov/mcp/tools/people.test.mjs
+index af16f962..e6dea8b5 100644
+--- a/src/lib/gov/mcp/tools/people.test.mjs
++++ b/src/lib/gov/mcp/tools/people.test.mjs
+@@ -302,3 +302,62 @@ test("get_person reports missing ids and MCP people tools never write", async ()
+   await execute("search_people", { q: "jane" }, ctx)
+   assert.deepEqual(writes, [])
+ })
++
++test("get_person carries dated posts and moves inside the size budget", async () => {
++  const offices = Array.from({ length: 30 }, (_, index) => ({
++    id: `org-${index}`,
++    name: `Example Contracting Office ${index}`,
++    org_type: "contracting_office",
++  }))
++  const tables = personTables({
++    gov_organizations: offices,
++    gov_contact_positions: offices.map((office, index) => ({
++      id: `post-${index}`,
++      contact_id: CONTACT_ID,
++      organization_id: office.id,
++      role_type: "contract_specialist",
++      raw_title: null,
++      valid_from: index === 0 ? "2025-05-01" : null,
++      valid_to: index === 0 ? null : `2024-${String((index % 12) + 1).padStart(2, "0")}-10`,
++      date_basis: index === 0 ? "stated" : "observed",
++      first_observed_at: "2023-01-10T00:00:00Z",
++      // The biography was read a month ago, so the post stays confirmed whenever the test runs.
++      last_observed_at: index === 0 ? new Date(Date.now() - 30 * 86_400_000).toISOString() : "2026-08-01T00:00:00Z",
++      // FPDS only observes; a stated start comes from an official biography.
++      source: index === 0 ? "bio_pages" : "fpds_staff",
++      source_url: `https://www.fpds.gov/${index}`,
++    })),
++    gov_contact_role_history: offices.map((office, index) => ({
++      id: `move-${index}`,
++      gov_contact_id: CONTACT_ID,
++      event_type: "transfer",
++      title: `Contract Specialist, ${office.name}`,
++      previous_title: null,
++      effective_date: `2025-${String((index % 12) + 1).padStart(2, "0")}-10`,
++      date_basis: "observed",
++      status: index === 1 ? "retracted" : "current",
++      source_provider: "fpds_staff",
++      source_url: `https://www.fpds.gov/move/${index}`,
++      organization_id: office.id,
++      previous_organization_id: offices[(index + 1) % offices.length].id,
++      evidence: [{ office_code: "X", raw_source_record: "must not escape" }],
++    })),
++  })
++  const result = await execute("get_person", { person_id: `contact:${CONTACT_ID}` }, context(tables))
++  assert.equal(result.status, "ready")
++  const { history } = result.data
++  assert.equal(history.truncated, true)
++  assert.ok(history.posts.length > 0 && history.moves.length > 0)
++  assert.deepEqual(
++    { started: history.posts[0].started, date_basis: history.posts[0].date_basis, current: history.posts[0].current },
++    { started: "2025-05-01", date_basis: "stated", current: true },
++  )
++  assert.match(history.posts[0].standing, /^Confirmed current as of \d{4}-\d{2}-\d{2} \(Official biography\)$/u)
++  assert.match(history.posts[1].standing, /^Last observed here 2024-/u)
++  assert.match(history.moves[0].certainty, /^Inferred move/u)
++  assert.equal(history.posts[1].date_basis, "observed")
++  assert.equal(history.posts[1].started, null)
++  assert.ok(!history.moves.some((move) => move.source_url.endsWith("/move/1")))
++  assert.doesNotMatch(JSON.stringify(result), /raw_source_record|identity_key|prediction_signals/u)
++  assert.ok(JSON.stringify(result).length < 11000)
++})
